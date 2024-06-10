@@ -517,6 +517,7 @@ class IndegoHub:
                 self._update_last_completed_mow(),
                 self._update_next_mow(),
                 self._update_operating_data(),
+                self._update_state(),
             ],
             return_exceptions=True,
         )
