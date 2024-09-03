@@ -1,4 +1,5 @@
 """Bosch Indego Mower integration."""
+from typing import Optional
 import asyncio
 import logging
 from datetime import datetime, timedelta
@@ -8,10 +9,6 @@ import voluptuous as vol
 from homeassistant.core import HomeAssistant, CoreState
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.components.binary_sensor import (
-    DEVICE_CLASS_CONNECTIVITY,
-    DEVICE_CLASS_PROBLEM,
-)
 from homeassistant.const import (
     CONF_DEVICE_CLASS,
     CONF_ICON,
@@ -19,14 +16,14 @@ from homeassistant.const import (
     CONF_NAME,
     CONF_TYPE,
     CONF_UNIT_OF_MEASUREMENT,
-    DEVICE_CLASS_BATTERY,
-    DEVICE_CLASS_TIMESTAMP,
     EVENT_HOMEASSISTANT_STARTED,
     EVENT_HOMEASSISTANT_STOP,
     STATE_ON,
     STATE_UNKNOWN,
-    TEMP_CELSIUS,
+    UnitOfTemperature,
 )
+from homeassistant.components.binary_sensor import BinarySensorDeviceClass
+from homeassistant.components.sensor import SensorDeviceClass
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.event import async_call_later
 from homeassistant.util.dt import utcnow
@@ -39,35 +36,8 @@ from pyIndego import IndegoAsyncClient
 from .api import IndegoOAuth2Session
 from .binary_sensor import IndegoBinarySensor
 from .vacuum import IndegoVacuum
-from .const import (
-    STATUS_UPDATE_FAILURE_DELAY_TIME,
-    BINARY_SENSOR_TYPE,
-    VACUUM_TYPE,
-    CONF_MOWER_SERIAL,
-    CONF_MOWER_NAME,
-    CONF_SERVICES_REGISTERED,
-    CONF_ATTR,
-    CONF_SEND_COMMAND,
-    CONF_SMARTMOWING,
-    DEFAULT_NAME_COMMANDS,
-    DOMAIN,
-    ENTITY_ALERT,
-    ENTITY_BATTERY,
-    ENTITY_LAST_COMPLETED,
-    ENTITY_LAWN_MOWED,
-    ENTITY_MOWER_STATE,
-    ENTITY_MOWER_STATE_DETAIL,
-    ENTITY_MOWING_MODE,
-    ENTITY_NEXT_MOW,
-    ENTITY_ONLINE,
-    ENTITY_RUNTIME,
-    ENTITY_UPDATE_AVAILABLE,
-    ENTITY_VACUUM,
-    INDEGO_PLATFORMS,
-    SENSOR_TYPE,
-    SERVICE_NAME_COMMAND,
-    SERVICE_NAME_SMARTMOW,
-)
+from .lawn_mower import IndegoLawnMower
+from .const import *
 from .sensor import IndegoSensor
 
 _LOGGER = logging.getLogger(__name__)
@@ -80,6 +50,24 @@ SERVICE_SCHEMA_COMMAND = vol.Schema({
 SERVICE_SCHEMA_SMARTMOWING = vol.Schema({
     vol.Optional(CONF_MOWER_SERIAL): cv.string,
     vol.Required(CONF_SMARTMOWING): cv.string
+})
+
+SERVICE_SCHEMA_DELETE_ALERT = vol.Schema({
+    vol.Optional(CONF_MOWER_SERIAL): cv.string,
+    vol.Required(SERVER_DATA_ALERT_INDEX): cv.positive_int
+})
+
+SERVICE_SCHEMA_DELETE_ALERT_ALL = vol.Schema({
+    vol.Optional(CONF_MOWER_SERIAL): cv.string
+})
+
+SERVICE_SCHEMA_READ_ALERT = vol.Schema({
+    vol.Optional(CONF_MOWER_SERIAL): cv.string,
+    vol.Required(SERVER_DATA_ALERT_INDEX): cv.positive_int
+})
+
+SERVICE_SCHEMA_READ_ALERT_ALL = vol.Schema({
+    vol.Optional(CONF_MOWER_SERIAL): cv.string
 })
 
 
@@ -95,22 +83,23 @@ ENTITY_DEFINITIONS = {
         CONF_TYPE: BINARY_SENSOR_TYPE,
         CONF_NAME: "online",
         CONF_ICON: "mdi:cloud-check",
-        CONF_DEVICE_CLASS: DEVICE_CLASS_CONNECTIVITY,
+        CONF_DEVICE_CLASS: BinarySensorDeviceClass.CONNECTIVITY,
         CONF_ATTR: [],
     },
     ENTITY_UPDATE_AVAILABLE: {
         CONF_TYPE: BINARY_SENSOR_TYPE,
         CONF_NAME: "update available",
         CONF_ICON: "mdi:download-outline",
-        CONF_DEVICE_CLASS: None,
+        CONF_DEVICE_CLASS: BinarySensorDeviceClass.UPDATE,
         CONF_ATTR: [],
     },
     ENTITY_ALERT: {
         CONF_TYPE: BINARY_SENSOR_TYPE,
         CONF_NAME: "alert",
         CONF_ICON: FUNC_ICON_MOWER_ALERT,
-        CONF_DEVICE_CLASS: DEVICE_CLASS_PROBLEM,
+        CONF_DEVICE_CLASS: BinarySensorDeviceClass.PROBLEM,
         CONF_ATTR: ["alerts_count"],
+        CONF_TRANSLATION_KEY: "indego_alert",
     },
     ENTITY_MOWER_STATE: {
         CONF_TYPE: SENSOR_TYPE,
@@ -119,6 +108,7 @@ ENTITY_DEFINITIONS = {
         CONF_DEVICE_CLASS: None,
         CONF_UNIT_OF_MEASUREMENT: None,
         CONF_ATTR: ["last_updated"],
+        CONF_TRANSLATION_KEY: "mower_state",
     },
     ENTITY_MOWER_STATE_DETAIL: {
         CONF_TYPE: SENSOR_TYPE,
@@ -131,20 +121,21 @@ ENTITY_DEFINITIONS = {
             "state_number",
             "state_description",
         ],
+        CONF_TRANSLATION_KEY: "mower_state_detail",
     },
     ENTITY_BATTERY: {
         CONF_TYPE: SENSOR_TYPE,
         CONF_NAME: "battery %",
         CONF_ICON: "battery",
-        CONF_DEVICE_CLASS: DEVICE_CLASS_BATTERY,
+        CONF_DEVICE_CLASS: SensorDeviceClass.BATTERY,
         CONF_UNIT_OF_MEASUREMENT: "%",
         CONF_ATTR: [
             "last_updated",
             "voltage_V",
             "discharge_Ah",
             "cycles",
-            f"battery_temp_{TEMP_CELSIUS}",
-            f"ambient_temp_{TEMP_CELSIUS}",
+            f"battery_temp_{UnitOfTemperature.CELSIUS}",
+            f"ambient_temp_{UnitOfTemperature.CELSIUS}",
         ],
     },
     ENTITY_LAWN_MOWED: {
@@ -166,7 +157,7 @@ ENTITY_DEFINITIONS = {
         CONF_TYPE: SENSOR_TYPE,
         CONF_NAME: "last completed",
         CONF_ICON: "mdi:calendar-check",
-        CONF_DEVICE_CLASS: DEVICE_CLASS_TIMESTAMP,
+        CONF_DEVICE_CLASS: SensorDeviceClass.TIMESTAMP,
         CONF_UNIT_OF_MEASUREMENT: None,
         CONF_ATTR: [],
     },
@@ -174,7 +165,7 @@ ENTITY_DEFINITIONS = {
         CONF_TYPE: SENSOR_TYPE,
         CONF_NAME: "next mow",
         CONF_ICON: "mdi:calendar-clock",
-        CONF_DEVICE_CLASS: DEVICE_CLASS_TIMESTAMP,
+        CONF_DEVICE_CLASS: SensorDeviceClass.TIMESTAMP,
         CONF_UNIT_OF_MEASUREMENT: None,
         CONF_ATTR: [],
     },
@@ -201,7 +192,20 @@ ENTITY_DEFINITIONS = {
     ENTITY_VACUUM: {
         CONF_TYPE: VACUUM_TYPE,
     },
+    ENTITY_LAWN_MOWER: {
+        CONF_TYPE: LAWN_MOWER_TYPE,
+    },
 }
+
+
+def format_indego_date(date: datetime) -> str:
+    return date.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def last_updated_now() -> str:
+    return homeassistant.util.dt.as_local(utcnow()).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -214,7 +218,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         entry.data[CONF_MOWER_NAME],
         oauth_session,
         entry.data[CONF_MOWER_SERIAL],
+        {
+            CONF_EXPOSE_INDEGO_AS_MOWER: entry.options.get(CONF_EXPOSE_INDEGO_AS_MOWER, False),
+            CONF_EXPOSE_INDEGO_AS_VACUUM: entry.options.get(CONF_EXPOSE_INDEGO_AS_VACUUM, False),
+            CONF_SHOW_ALL_ALERTS: entry.options.get(CONF_SHOW_ALL_ALERTS, False),
+        },
         hass,
+        entry.options.get(CONF_USER_AGENT)
     )
 
     async def load_platforms():
@@ -228,8 +238,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     try:
         await indego_hub.update_generic_data_and_load_platforms(load_platforms)
-    except AttributeError as e:
-        _LOGGER.warning("Login unsuccessful: %s", e)
+    except AttributeError as exc:
+        _LOGGER.warning("Login unsuccessful: %s", str(exc))
         return False
 
     def find_instance_for_mower_service_call(call):
@@ -253,15 +263,55 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         instance = find_instance_for_mower_service_call(call)
         command = call.data.get(CONF_SEND_COMMAND, DEFAULT_NAME_COMMANDS)
         _LOGGER.debug("Indego.send_command service called, with command: %s", command)
+
         await instance.async_send_command_to_client(command)
 
     async def async_send_smartmowing(call):
         """Handle the smartmowing service call."""
         instance = find_instance_for_mower_service_call(call)
         enable = call.data.get(CONF_SMARTMOWING, DEFAULT_NAME_COMMANDS)
-        _LOGGER.debug("Indego.send_smartmowing service called, set to %s", enable)
+        _LOGGER.debug("Indego.send_smartmowing service called, enable: %s", enable)
+
         await instance._indego_client.put_mow_mode(enable)
         await instance._update_generic_data()
+
+    async def async_delete_alert(call):
+        """Handle the service call."""
+        instance = find_instance_for_mower_service_call(call)
+        index = call.data.get(SERVER_DATA_ALERT_INDEX, DEFAULT_NAME_COMMANDS)
+        _LOGGER.debug("Indego.delete_alert service called with alert index: %s", index)
+
+        await instance._update_alerts()
+        await instance._indego_client.delete_alert(index)
+        await instance._update_alerts()     
+
+    async def async_delete_alert_all(call):
+        """Handle the service call."""
+        instance = find_instance_for_mower_service_call(call)
+        _LOGGER.debug("Indego.delete_alert_all service called")
+
+        await instance._update_alerts()
+        await instance._indego_client.delete_all_alerts()
+        await instance._update_alerts()   
+
+    async def async_read_alert(call):
+        """Handle the service call."""
+        instance = find_instance_for_mower_service_call(call)
+        index = call.data.get(SERVER_DATA_ALERT_INDEX, DEFAULT_NAME_COMMANDS)
+        _LOGGER.debug("Indego.read_alert service called with alert index: %s", index)
+
+        await instance._update_alerts()
+        await instance._indego_client.put_alert_read(index)
+        await instance._update_alerts()
+
+    async def async_read_alert_all(call):
+        """Handle the service call."""
+        instance = find_instance_for_mower_service_call(call)
+        _LOGGER.debug("Indego.read_alert_all service called")
+
+        await instance._update_alerts()
+        await instance._indego_client.put_all_alerts_read()
+        await instance._update_alerts()
 
     # In HASS we can have multiple Indego component instances as long as the mower serial is unique.
     # So the mower services should only need to be registered for the first instance.
@@ -280,6 +330,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             SERVICE_NAME_SMARTMOW,
             async_send_smartmowing,
             schema=SERVICE_SCHEMA_SMARTMOWING,
+        )
+        hass.services.async_register(
+            DOMAIN, 
+            SERVICE_NAME_DELETE_ALERT, 
+            async_delete_alert, 
+            schema=SERVICE_SCHEMA_DELETE_ALERT
+        )
+        hass.services.async_register(
+            DOMAIN, 
+            SERVICE_NAME_READ_ALERT, 
+            async_read_alert, 
+            schema=SERVICE_SCHEMA_READ_ALERT
+        )
+        hass.services.async_register(
+            DOMAIN, 
+            SERVICE_NAME_DELETE_ALERT_ALL, 
+            async_delete_alert_all, 
+            schema=SERVICE_SCHEMA_DELETE_ALERT_ALL
+        )
+        hass.services.async_register(
+            DOMAIN, 
+            SERVICE_NAME_READ_ALERT_ALL, 
+            async_read_alert_all, 
+            schema=SERVICE_SCHEMA_READ_ALERT_ALL
         )
 
         hass.data[DOMAIN][CONF_SERVICES_REGISTERED] = entry.entry_id
@@ -309,7 +383,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 class IndegoHub:
     """Class for the IndegoHub, which controls the sensors and binary sensors."""
 
-    def __init__(self, name: str, session: IndegoOAuth2Session, serial: str, hass: HomeAssistant):
+    def __init__(self, name: str, session: IndegoOAuth2Session, serial: str, features: dict, hass: HomeAssistant, user_agent: Optional[str] = None):
         """Initialize the IndegoHub.
 
         Args:
@@ -321,6 +395,7 @@ class IndegoHub:
         """
         self._mower_name = name
         self._serial = serial
+        self._features = features
         self._hass = hass
         self._unsub_refresh_state = None
         self._refresh_state_task = None
@@ -329,6 +404,7 @@ class IndegoHub:
         self._shutdown = False
         self._latest_alert = None
         self.entities = {}
+        self._update_fail_count = None
 
         async def async_token_refresh() -> str:
             await session.async_ensure_token_valid()
@@ -341,12 +417,12 @@ class IndegoHub:
             session=async_get_clientsession(hass),
             raise_request_exceptions=True
         )
+        self._indego_client.set_default_header(HTTP_HEADER_USER_AGENT, user_agent)
 
     async def async_send_command_to_client(self, command: str):
         """Send a mower command to the Indego client."""
         _LOGGER.debug("Sending command to mower (%s): '%s'", self._serial, command)
         await self._indego_client.put_command(command)
-        await self._update_state()
 
     def _create_entities(self, device_info):
         """Create sub-entities and add them to Hass."""
@@ -362,7 +438,8 @@ class IndegoHub:
                     entity[CONF_DEVICE_CLASS],
                     entity[CONF_UNIT_OF_MEASUREMENT],
                     entity[CONF_ATTR],
-                    device_info
+                    device_info,
+                    translation_key=entity[CONF_TRANSLATION_KEY] if CONF_TRANSLATION_KEY in entity else None,
                 )
 
             elif entity[CONF_TYPE] == BINARY_SENSOR_TYPE:
@@ -372,16 +449,27 @@ class IndegoHub:
                     entity[CONF_ICON],
                     entity[CONF_DEVICE_CLASS],
                     entity[CONF_ATTR],
-                    device_info
+                    device_info,
+                    translation_key=entity[CONF_TRANSLATION_KEY] if CONF_TRANSLATION_KEY in entity else None,
                 )
 
+            elif entity[CONF_TYPE] == LAWN_MOWER_TYPE:
+                if self._features[CONF_EXPOSE_INDEGO_AS_MOWER]:
+                    self.entities[entity_key] = IndegoLawnMower(
+                        f"indego_{self._serial}",
+                        self._mower_name,
+                        device_info,
+                        self
+                    )
+
             elif entity[CONF_TYPE] == VACUUM_TYPE:
-                self.entities[entity_key] = IndegoVacuum(
-                    f"indego_{self._serial}",
-                    self._mower_name,
-                    device_info,
-                    self
-                )
+                if self._features[CONF_EXPOSE_INDEGO_AS_VACUUM]:
+                    self.entities[entity_key] = IndegoVacuum(
+                        f"indego_{self._serial}",
+                        self._mower_name,
+                        device_info,
+                        self
+                    )
 
     async def update_generic_data_and_load_platforms(self, load_platforms):
         """Update the generic mower data, so we can create the HA platforms for the Indego component."""
@@ -390,7 +478,6 @@ class IndegoHub:
 
         device_info = DeviceInfo(
             identifiers={(DOMAIN, self._serial)},
-            #serial_number=self._serial,
             manufacturer="Bosch",
             name=self._mower_name,
             model=generic_data.bareToolnumber if generic_data else None,
@@ -417,15 +504,16 @@ class IndegoHub:
         """Do the initial update and create all entities."""
         _LOGGER.debug("Starting initial update.")
 
-        self._create_refresh_state_task()
+        self.set_online_state(False)
+        await self._create_refresh_state_task()
         await asyncio.gather(*[self.refresh_10m(), self.refresh_24h()])
 
         try:
             _LOGGER.debug("Refreshing initial operating data.")
             await self._update_operating_data()
 
-        except Exception as e:
-            _LOGGER.info("Update operating data got an exception: %s", e)
+        except Exception as exc:
+            _LOGGER.warning("Error %s for while performing initial update", str(exc))
 
     async def async_shutdown(self, _=None):
         """Remove all future updates, cancel tasks and close the client."""
@@ -458,18 +546,24 @@ class IndegoHub:
 
         update_failed = False
         try:
-            await self._update_state()
+            await self._update_state(longpoll=(self._update_fail_count is None or self._update_fail_count == 0))
+            self._update_fail_count = 0
 
         except Exception as exc:
             update_failed = True
-            _LOGGER.warning("Mower state update failed, reason: %s", exc)
+            _LOGGER.warning("Mower state update failed, reason: %s", str(exc))
+            #_LOGGER.exception(exc)
+            self.set_online_state(False)
 
         if self._shutdown:
             return
 
         if update_failed:
-            _LOGGER.debug("Delaying next status update with %i seconds due to previous failure...", STATUS_UPDATE_FAILURE_DELAY_TIME)
-            when = datetime.now() + timedelta(seconds=STATUS_UPDATE_FAILURE_DELAY_TIME)
+            if self._update_fail_count is None:
+                self._update_fail_count = 1
+            _LOGGER.debug("Delaying next status update with %i seconds due to previous failure...", STATUS_UPDATE_FAILURE_DELAY_TIME[self._update_fail_count])
+            when = datetime.now() + timedelta(seconds=STATUS_UPDATE_FAILURE_DELAY_TIME[self._update_fail_count])
+            self._update_fail_count = min(self._update_fail_count + 1, len(STATUS_UPDATE_FAILURE_DELAY_TIME) - 1)
             self._unsub_refresh_state = async_track_point_in_time(self._hass, self._create_refresh_state_task, when)
             return
 
@@ -481,7 +575,7 @@ class IndegoHub:
                     await self._update_operating_data()
 
                 except Exception as exc:
-                    _LOGGER.warning("Mower operating data update failed, reason: %s", exc)
+                    _LOGGER.warning("Mower operating data update failed, reason: %s", str(exc))
 
             if self._indego_client.state.error != self._latest_alert:
                 self._latest_alert = self._indego_client.state.error
@@ -490,11 +584,11 @@ class IndegoHub:
                     await self._update_alerts()
 
                 except Exception as exc:
-                    _LOGGER.warning("Mower alerts update failed, reason: %s", exc)
+                    _LOGGER.warning("Mower alerts update failed, reason: %s", str(exc))
 
-            self._create_refresh_state_task()
+        await self._create_refresh_state_task()
 
-    def _create_refresh_state_task(self, event=None):
+    async def _create_refresh_state_task(self, event=None):
         """Create a task to refresh the mower state."""
         self._refresh_state_task = self._hass.async_create_task(self.refresh_state())
 
@@ -528,8 +622,8 @@ class IndegoHub:
             if res and isinstance(res, BaseException):
                 try:
                     raise res
-                except Exception as e:
-                    _LOGGER.warning("Uncaught error: %s on index: %s", e, index)
+                except Exception as exc:
+                    _LOGGER.warning("Error %s for index %i while performing 10m update", str(exc), index)
             index += 1
 
         self._refresh_10m_remover = async_call_later(
@@ -543,92 +637,88 @@ class IndegoHub:
         try:
             await self._update_updates_available()
 
-        except Exception as e:
-            _LOGGER.info("Update updates available got an exception: %s", e)
+        except Exception as exc:
+            _LOGGER.warning("Error %s while performing 24h update", str(exc))
 
         self._refresh_24h_remover = async_call_later(self._hass, 86400, self.refresh_24h)
 
     async def _update_operating_data(self):
         await self._indego_client.update_operating_data()
 
-        # dependent state updates
         _LOGGER.debug(f"Updating operating data")
         if self._indego_client.operating_data:
-            self.entities[ENTITY_ONLINE].state = self._indego_client._online
             self.entities[ENTITY_BATTERY].state = self._indego_client.operating_data.battery.percent_adjusted
-            self.entities[ENTITY_VACUUM].battery_level = self._indego_client.operating_data.battery.percent_adjusted
 
-            # dependent attribute updates
-            self.entities[ENTITY_BATTERY].add_attribute(
+            if ENTITY_VACUUM in self.entities:
+                self.entities[ENTITY_VACUUM].battery_level = self._indego_client.operating_data.battery.percent_adjusted
+
+            self.entities[ENTITY_BATTERY].add_attributes(
                 {
-                    "last_updated": homeassistant.util.dt.as_local(utcnow()).strftime(
-                        "%Y-%m-%d %H:%M"
-                    ),
+                    "last_updated": last_updated_now(),
                     "voltage_V": self._indego_client.operating_data.battery.voltage,
                     "discharge_Ah": self._indego_client.operating_data.battery.discharge,
                     "cycles": self._indego_client.operating_data.battery.cycles,
-                    f"battery_temp_{TEMP_CELSIUS}": self._indego_client.operating_data.battery.battery_temp,
-                    f"ambient_temp_{TEMP_CELSIUS}": self._indego_client.operating_data.battery.ambient_temp,
+                    f"battery_temp_{UnitOfTemperature.CELSIUS}": self._indego_client.operating_data.battery.battery_temp,
+                    f"ambient_temp_{UnitOfTemperature.CELSIUS}": self._indego_client.operating_data.battery.ambient_temp,
                 }
             )
 
-        else:
-            self.entities[ENTITY_ONLINE].state = self._indego_client._online
+    def set_online_state(self, online: bool):
+        _LOGGER.debug("Set online state: %s", online)
 
-    async def _update_state(self):
-        await self._indego_client.update_state(longpoll=True, longpoll_timeout=300)
+        self.entities[ENTITY_ONLINE].state = online
+        self.entities[ENTITY_MOWER_STATE].set_cloud_connection_state(online)
+        self.entities[ENTITY_MOWER_STATE_DETAIL].set_cloud_connection_state(online)
 
-        # dependent state updates
+        if ENTITY_VACUUM in self.entities:
+            self.entities[ENTITY_VACUUM].set_cloud_connection_state(online)
+
+        if ENTITY_LAWN_MOWER in self.entities:
+            self.entities[ENTITY_LAWN_MOWER].set_cloud_connection_state(online)
+
+    async def _update_state(self, longpoll: bool = True):
+        await self._indego_client.update_state(longpoll=longpoll, longpoll_timeout=230)
+
         if self._shutdown:
             return
 
         if not self._indego_client.state:
+            self.set_online_state(False)
             return  # State update failed
 
+        self.set_online_state(self._indego_client.online)
         self.entities[ENTITY_MOWER_STATE].state = self._indego_client.state_description
-        self.entities[
-            ENTITY_MOWER_STATE_DETAIL
-        ].state = self._indego_client.state_description_detail
+        self.entities[ENTITY_MOWER_STATE_DETAIL].state = self._indego_client.state_description_detail
         self.entities[ENTITY_LAWN_MOWED].state = self._indego_client.state.mowed
         self.entities[ENTITY_RUNTIME].state = self._indego_client.state.runtime.total.cut
         self.entities[ENTITY_BATTERY].charging = (
             True if self._indego_client.state_description_detail == "Charging" else False
         )
-        self.entities[ENTITY_VACUUM].battery_charging = self.entities[ENTITY_BATTERY].charging
 
-        # dependent attribute updates
-        self.entities[ENTITY_MOWER_STATE].add_attribute(
+        self.entities[ENTITY_MOWER_STATE].add_attributes(
             {
-                "last_updated": homeassistant.util.dt.as_local(utcnow()).strftime(
-                    "%Y-%m-%d %H:%M"
-                )
+                "last_updated": last_updated_now()
             }
         )
 
-        self.entities[ENTITY_MOWER_STATE_DETAIL].add_attribute(
+        self.entities[ENTITY_MOWER_STATE_DETAIL].add_attributes(
             {
-                "last_updated": homeassistant.util.dt.as_local(utcnow()).strftime(
-                    "%Y-%m-%d %H:%M"
-                ),
+                "last_updated": last_updated_now(),
                 "state_number": self._indego_client.state.state,
                 "state_description": self._indego_client.state_description_detail,
             }
         )
 
-        self.entities[ENTITY_VACUUM].indego_state = self._indego_client.state.state
-
-        self.entities[ENTITY_LAWN_MOWED].add_attribute(
+        self.entities[ENTITY_LAWN_MOWED].add_attributes(
             {
-                "last_updated": homeassistant.util.dt.as_local(utcnow()).strftime(
-                    "%Y-%m-%d %H:%M"
-                ),
+                "last_updated": last_updated_now(),
                 "last_session_operation_min": self._indego_client.state.runtime.session.operate,
                 "last_session_cut_min": self._indego_client.state.runtime.session.cut,
                 "last_session_charge_min": self._indego_client.state.runtime.session.charge,
             }
         )
 
-        self.entities[ENTITY_RUNTIME].add_attribute(
+        self.entities[ENTITY_RUNTIME].add_attributes(
             {
                 "total_operation_time_h": self._indego_client.state.runtime.total.operate,
                 "total_mowing_time_h": self._indego_client.state.runtime.total.cut,
@@ -636,10 +726,16 @@ class IndegoHub:
             }
         )
 
+        if ENTITY_VACUUM in self.entities:
+            self.entities[ENTITY_VACUUM].indego_state = self._indego_client.state.state
+            self.entities[ENTITY_VACUUM].battery_charging = self.entities[ENTITY_BATTERY].charging
+
+        if ENTITY_LAWN_MOWER in self.entities:
+            self.entities[ENTITY_LAWN_MOWER].indego_state = self._indego_client.state.state
+
     async def _update_generic_data(self):
         await self._indego_client.update_generic_data()
 
-        # dependent state updates
         if self._indego_client.generic_data:
             if ENTITY_MOWING_MODE in self.entities:
                 self.entities[
@@ -651,32 +747,46 @@ class IndegoHub:
     async def _update_alerts(self):
         await self._indego_client.update_alerts()
 
-        # dependent state updates
-        if self._indego_client.alerts:
-            self.entities[ENTITY_ALERT].state = self._indego_client.alerts_count > 0
+        self.entities[ENTITY_ALERT].state = self._indego_client.alerts_count > 0
 
-            self.entities[ENTITY_ALERT].add_attribute(
-                {"alerts_count": self._indego_client.alerts_count, }
+        if self._indego_client.alerts:
+            self.entities[ENTITY_ALERT].add_attributes(
+                {
+                    "alerts_count": self._indego_client.alerts_count,
+                    "last_alert_error_code": self._indego_client.alerts[0].error_code,
+                    "last_alert_message": self._indego_client.alerts[0].message,
+                    "last_alert_date": format_indego_date(self._indego_client.alerts[0].date),
+                    "last_alert_read": self._indego_client.alerts[0].read_status,
+                }, False
             )
 
-        else:
-            self.entities[ENTITY_ALERT].state = 0
+            # It's not recommended to track full alerts, disabled by default.
+            # See the developer docs: https://developers.home-assistant.io/docs/core/entity/
+            if self._features[CONF_SHOW_ALL_ALERTS]:
+                alert_index = 0
+                for index, alert in enumerate(self._indego_client.alerts):
+                    self.entities[ENTITY_ALERT].add_attributes({
+                        ("alert_%i" % index): "%s: %s" % (format_indego_date(alert.date), alert.message)
+                    }, False)
+                    alert_index = index
 
-        j = len(self._indego_client.alerts)
-        # _LOGGER.info(f"Structuring ALERTS.{j}")
-        for i in range(j):
-            self.entities[ENTITY_ALERT].add_attribute(
+                # Clear any other alerts that no longer exist.
+                alert_index += 1
+                while self.entities[ENTITY_ALERT].clear_attribute("alert_%i" % alert_index, False):
+                    alert_index += 1
+
+            self.entities[ENTITY_ALERT].async_schedule_update_ha_state()
+
+        else:
+            self.entities[ENTITY_ALERT].set_attributes(
                 {
-                    self._indego_client.alerts[i].date.strftime("%Y-%m-%d %H:%M"): str(
-                        self._indego_client.alerts[i].alert_description
-                    ),
+                    "alerts_count": self._indego_client.alerts_count
                 }
             )
 
     async def _update_updates_available(self):
         await self._indego_client.update_updates_available()
 
-        # dependent state updates
         self.entities[ENTITY_UPDATE_AVAILABLE].state = self._indego_client.update_available
 
     async def _update_last_completed_mow(self):
@@ -687,19 +797,9 @@ class IndegoHub:
                 ENTITY_LAST_COMPLETED
             ].state = self._indego_client.last_completed_mow.isoformat()
 
-            self.entities[ENTITY_LAST_COMPLETED].add_attribute(
+            self.entities[ENTITY_LAWN_MOWED].add_attributes(
                 {
-                    "last_completed_mow": self._indego_client.last_completed_mow.strftime(
-                        "%Y-%m-%d %H:%M"
-                    )
-                }
-            )
-
-            self.entities[ENTITY_LAWN_MOWED].add_attribute(
-                {
-                    "last_completed_mow": self._indego_client.last_completed_mow.strftime(
-                        "%Y-%m-%d %H:%M"
-                    )
+                    "last_completed_mow": format_indego_date(self._indego_client.last_completed_mow)
                 }
             )
 
@@ -709,14 +809,20 @@ class IndegoHub:
         if self._indego_client.next_mow:
             self.entities[ENTITY_NEXT_MOW].state = self._indego_client.next_mow.isoformat()
 
-            self.entities[ENTITY_NEXT_MOW].add_attribute(
-                {"next_mow": self._indego_client.next_mow.strftime("%Y-%m-%d %H:%M")}
+            next_mow = format_indego_date(self._indego_client.next_mow)
+
+            self.entities[ENTITY_NEXT_MOW].add_attributes(
+                {"next_mow": next_mow}
             )
 
-            self.entities[ENTITY_LAWN_MOWED].add_attribute(
-                {"next_mow": self._indego_client.next_mow.strftime("%Y-%m-%d %H:%M")}
+            self.entities[ENTITY_LAWN_MOWED].add_attributes(
+                {"next_mow": next_mow}
             )
 
     @property
     def serial(self) -> str:
         return self._serial
+
+    @property
+    def client(self) -> IndegoAsyncClient:
+        return self._indego_client
